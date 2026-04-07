@@ -225,15 +225,16 @@ function getLeafPositions(branches: BranchData[], count: number): Array<{ pos: T
 
 // ─── Full tree scene mesh ────────────────────────────────────────────────────
 interface TreeMeshProps {
-  leafCount: number
+  leaves: Leaf[]
   isShaking: boolean
   shakePhase: number
   fallingIndex: number | null
   onLeafFallDone: () => void
 }
 
-function TreeMesh({ leafCount, isShaking, shakePhase, fallingIndex, onLeafFallDone }: TreeMeshProps) {
+function TreeMesh({ leaves, isShaking, shakePhase, fallingIndex, onLeafFallDone }: TreeMeshProps) {
   const groupRef = useRef<THREE.Group>(null!)
+  const leafCount = leaves.length
 
   const branches = useMemo(() => {
     const b: BranchData[] = []
@@ -265,21 +266,25 @@ function TreeMesh({ leafCount, isShaking, shakePhase, fallingIndex, onLeafFallDo
       {/* Trunk & branches — single merged mesh */}
       <TreeBranches branches={branches} />
 
-      {/* Cherry blossoms */}
-      {visibleLeaves.map((l, i) => (
-        <BlossomCluster
-          key={i}
-          leafIndex={i}
-          position={l.pos}
-          rotation={l.rot}
-          scale={l.scale}
-          color={l.color}
-          isFalling={fallingIndex === i}
-          onFallDone={onLeafFallDone}
-          isShaking={isShaking}
-          shakePhase={shakePhase}
-        />
-      ))}
+      {/* Cherry blossoms — keys tied to DB ids so counts can change without swapping meshes */}
+      {leaves.map((leaf, i) => {
+        const l = visibleLeaves[i]
+        if (!l) return null
+        return (
+          <BlossomCluster
+            key={leaf.id}
+            leafIndex={i}
+            position={l.pos}
+            rotation={l.rot}
+            scale={l.scale}
+            color={l.color}
+            isFalling={fallingIndex === i}
+            onFallDone={onLeafFallDone}
+            isShaking={isShaking}
+            shakePhase={shakePhase}
+          />
+        )
+      })}
     </group>
   )
 }
@@ -310,70 +315,136 @@ interface Props {
   onLeafRemoved: (id: string) => void
   isShaking: boolean
   setIsShaking: (v: boolean) => void
+  remoteFall: { id: string; key: number } | null
+  onRemoteFallResolved: (id: string | null) => void
+  claimLocalShakeDelete: (id: string) => void
+  releaseLocalShakeDelete: (id: string) => void
 }
 
-export default function TreeScene({ leaves, onShakeComplete, onLeafRemoved, isShaking, setIsShaking }: Props) {
+export default function TreeScene({
+  leaves,
+  onShakeComplete,
+  onLeafRemoved,
+  isShaking,
+  setIsShaking,
+  remoteFall,
+  onRemoteFallResolved,
+  claimLocalShakeDelete,
+  releaseLocalShakeDelete,
+}: Props) {
   const [shakePhase, setShakePhase] = useState(0)
   const [fallingIndex, setFallingIndex] = useState<number | null>(null)
   const [isDragging, setIsDragging] = useState(false)
   const shakeRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const pendingLocalLeafRef = useRef<Leaf | null>(null)
+  const activeRemoteFallIdRef = useRef<string | null>(null)
+  const isShakingRef = useRef(false)
+  const leavesRef = useRef(leaves)
   const isEmpty = leaves.length === 0
 
-  const handleShake = async () => {
-    if (isShaking || isEmpty) return
-    setIsShaking(true)
+  useEffect(() => {
+    leavesRef.current = leaves
+  }, [leaves])
 
-    // Animate shake phase
+  useEffect(() => {
+    isShakingRef.current = isShaking
+  }, [isShaking])
+
+  const clearShakeInterval = useCallback(() => {
+    if (shakeRef.current) {
+      clearInterval(shakeRef.current)
+      shakeRef.current = null
+    }
+  }, [])
+
+  const startShakeInterval = useCallback(() => {
+    clearShakeInterval()
     let phase = 0
     shakeRef.current = setInterval(() => {
       phase += 0.05
       setShakePhase(phase)
-      if (phase >= 1) clearInterval(shakeRef.current!)
+      if (phase >= 1 && shakeRef.current) clearInterval(shakeRef.current)
     }, 16)
+  }, [clearShakeInterval])
 
-    // Pick a leaf to fall (the last one in array = the one being removed)
-    const fallIdx = Math.min(leaves.length - 1, Math.floor(Math.random() * Math.min(leaves.length, 5)))
-    setFallingIndex(fallIdx)
+  const resetShakeVisual = useCallback(() => {
+    clearShakeInterval()
+    setShakePhase(0)
+    setIsShaking(false)
+    setFallingIndex(null)
+    pendingLocalLeafRef.current = null
+    activeRemoteFallIdRef.current = null
+  }, [clearShakeInterval, setIsShaking])
+
+  const handleShake = async () => {
+    if (isShaking || isEmpty) return
+    setIsShaking(true)
+    pendingLocalLeafRef.current = null
+    activeRemoteFallIdRef.current = null
+    startShakeInterval()
 
     try {
       const res = await fetch('/api/leaves/random')
       if (res.status === 404) {
-        // No leaves left
-        setIsShaking(false)
-        setFallingIndex(null)
+        resetShakeVisual()
         return
       }
-      const data = await res.json()
-      if (res.ok) {
-        onLeafRemoved(data.id)
-        setTimeout(() => {
-          onShakeComplete(data)
-        }, 800)
-      } else {
-        // Non-OK, non-404 response (e.g. 500) — clear everything so the UI
-        // doesn't stay locked in the shaking state.
-        clearInterval(shakeRef.current!)
-        setShakePhase(0)
-        setIsShaking(false)
-        setFallingIndex(null)
+      const data = (await res.json()) as Leaf & { error?: string }
+      if (!res.ok) {
+        resetShakeVisual()
+        return
       }
+      claimLocalShakeDelete(data.id)
+      pendingLocalLeafRef.current = data
+      const idx = leavesRef.current.findIndex(l => l.id === data.id)
+      setFallingIndex(idx >= 0 ? idx : 0)
     } catch {
-      clearInterval(shakeRef.current!)
-      setShakePhase(0)
-      setIsShaking(false)
-      setFallingIndex(null)
+      resetShakeVisual()
     }
   }
 
   const handleFallDone = useCallback(() => {
+    clearShakeInterval()
+    const localLeaf = pendingLocalLeafRef.current
+    const remoteId = activeRemoteFallIdRef.current
+    pendingLocalLeafRef.current = null
+    activeRemoteFallIdRef.current = null
     setFallingIndex(null)
     setIsShaking(false)
     setShakePhase(0)
-  }, [])
 
-  // If the falling leaf is removed from the visible set before the animation
-  // completes (e.g. it was the last leaf), reset the shake state so the UI
-  // doesn't get permanently stuck.
+    if (localLeaf) {
+      onLeafRemoved(localLeaf.id)
+      releaseLocalShakeDelete(localLeaf.id)
+      onShakeComplete(localLeaf)
+    } else if (remoteId !== null) {
+      onRemoteFallResolved(remoteId)
+    }
+  }, [clearShakeInterval, onLeafRemoved, onShakeComplete, onRemoteFallResolved, releaseLocalShakeDelete, setIsShaking])
+
+  useEffect(() => {
+    if (!remoteFall) return
+    const id = remoteFall.id
+    const idx = leavesRef.current.findIndex(l => l.id === id)
+    if (idx === -1) {
+      onRemoteFallResolved(null)
+      return
+    }
+    if (isShakingRef.current) {
+      if (pendingLocalLeafRef.current?.id === id) {
+        onRemoteFallResolved(null)
+        return
+      }
+      onRemoteFallResolved(id)
+      return
+    }
+    activeRemoteFallIdRef.current = id
+    pendingLocalLeafRef.current = null
+    setIsShaking(true)
+    startShakeInterval()
+    setFallingIndex(idx)
+  }, [remoteFall?.key, onRemoteFallResolved, startShakeInterval, setIsShaking])
+
   useEffect(() => {
     if (fallingIndex !== null && fallingIndex >= leaves.length) {
       handleFallDone()
@@ -381,8 +452,10 @@ export default function TreeScene({ leaves, onShakeComplete, onLeafRemoved, isSh
   }, [fallingIndex, leaves.length, handleFallDone])
 
   useEffect(() => {
-    return () => { if (shakeRef.current) clearInterval(shakeRef.current) }
-  }, [])
+    return () => {
+      clearShakeInterval()
+    }
+  }, [clearShakeInterval])
 
   return (
     <div className="relative w-full flex flex-col items-center max-w-[100vw] mx-auto px-0">
@@ -414,7 +487,7 @@ export default function TreeScene({ leaves, onShakeComplete, onLeafRemoved, isSh
           <directionalLight position={[-4, 6, -3]} intensity={0.42} color="#fce7f3" />
 
           <TreeMesh
-            leafCount={leaves.length}
+            leaves={leaves}
             isShaking={isShaking}
             shakePhase={shakePhase}
             fallingIndex={fallingIndex}

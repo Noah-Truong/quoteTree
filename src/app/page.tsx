@@ -1,11 +1,11 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import TreeScene from '@/components/TreeScene'
 import AddLeafModal from '@/components/AddLeafModal'
 import RandomLeafCard from '@/components/RandomLeafCard'
-import { Leaf } from '@/lib/supabase'
+import { Leaf, getSupabase } from '@/lib/supabase'
 
 export default function Home() {
   const [leaves, setLeaves] = useState<Leaf[]>([])
@@ -13,6 +13,18 @@ export default function Home() {
   const [randomLeaf, setRandomLeaf] = useState<Leaf | null>(null)
   const [isShaking, setIsShaking] = useState(false)
   const [loading, setLoading] = useState(true)
+  const [remoteFall, setRemoteFall] = useState<{ id: string; key: number } | null>(null)
+
+  /** Rows we deleted via this client’s shake — ignore matching Realtime DELETE (same echo). */
+  const pendingLocalShakeIdsRef = useRef<Set<string>>(new Set())
+
+  const claimLocalShakeDelete = useCallback((id: string) => {
+    pendingLocalShakeIdsRef.current.add(id)
+  }, [])
+
+  const releaseLocalShakeDelete = useCallback((id: string) => {
+    pendingLocalShakeIdsRef.current.delete(id)
+  }, [])
 
   useEffect(() => {
     fetch('/api/leaves')
@@ -23,6 +35,45 @@ export default function Home() {
       .finally(() => setLoading(false))
   }, [])
 
+  useEffect(() => {
+    let supabase: ReturnType<typeof getSupabase>
+    try {
+      supabase = getSupabase()
+    } catch {
+      return
+    }
+
+    const channel = supabase
+      .channel('leaves-realtime')
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'leaves' },
+        (payload) => {
+          const row = payload.new as Leaf
+          setLeaves((prev) => (prev.some((l) => l.id === row.id) ? prev : [row, ...prev]))
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: 'DELETE', schema: 'public', table: 'leaves' },
+        (payload) => {
+          const oldRow = payload.old as Partial<Leaf> | null
+          const id = oldRow?.id
+          if (!id || typeof id !== 'string') return
+          if (pendingLocalShakeIdsRef.current.has(id)) {
+            pendingLocalShakeIdsRef.current.delete(id)
+            return
+          }
+          setRemoteFall({ id, key: Date.now() })
+        }
+      )
+      .subscribe()
+
+    return () => {
+      void supabase.removeChannel(channel)
+    }
+  }, [])
+
   const handleAddLeaf = (leaf: Leaf) => {
     setLeaves(prev => [leaf, ...prev])
   }
@@ -30,6 +81,11 @@ export default function Home() {
   const handleLeafRemoved = (id: string) => {
     setLeaves(prev => prev.filter(l => l.id !== id))
   }
+
+  const onRemoteFallResolved = useCallback((id: string | null) => {
+    setRemoteFall(null)
+    if (id !== null) setLeaves((prev) => prev.filter((l) => l.id !== id))
+  }, [])
 
   return (
     <main className="min-h-[100dvh] bg-white flex flex-col overflow-x-hidden relative">
@@ -75,6 +131,10 @@ export default function Home() {
               onLeafRemoved={handleLeafRemoved}
               isShaking={isShaking}
               setIsShaking={setIsShaking}
+              remoteFall={remoteFall}
+              onRemoteFallResolved={onRemoteFallResolved}
+              claimLocalShakeDelete={claimLocalShakeDelete}
+              releaseLocalShakeDelete={releaseLocalShakeDelete}
             />
           </div>
         )}

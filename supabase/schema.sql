@@ -26,6 +26,9 @@ create policy "Anyone can delete leaves"
   on leaves for delete
   using (true);
 
+-- Broadcast INSERT/DELETE to connected browsers (enable “Realtime” for `leaves` in Dashboard if needed)
+alter publication supabase_realtime add table leaves;
+
 -- Seed some starter leaves
 insert into leaves (content, author) values
   ('The secret of getting ahead is getting started.', 'Mark Twain'),
